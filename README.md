@@ -12,8 +12,10 @@ The bot captures the screen, finds game objects with OpenCV, and controls the mo
 - Finds empty fields and plants wheat.
 - Finds mature wheat and harvests it.
 - Selects the scythe nearest to the clicked wheat.
+- Searches several template scales for different game zoom and display sizes.
 - Works without boat or market anchors when the game view stays stable.
 - Drags through detected wheat centers instead of a large fixed boundary.
+- Plants through actual empty-field centers and rescans before harvesting.
 - Detects a full silo.
 - Collects sold items and creates new market offers.
 - Uses image templates instead of fixed positions for most actions.
@@ -140,6 +142,8 @@ The scripts and screenshots in `test-environments/` are manual OpenCV checks. Th
 ## Diagnostics
 
 Each bot session writes a timestamped log under `diagnostics/`. Failed actions can also save marked screenshots there. Screenshots show detected matches, selected points, and the planned route. The bot keeps the latest 20 failure screenshots.
+
+Detection logs include `template_scale`. This shows which resized template matched the current game view.
 
 When reporting a new problem, send the latest session log and failure screenshot.
 

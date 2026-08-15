@@ -13,6 +13,7 @@ class TemplateMatchResult:
     best_confidence: float
     raw_match_count: int = 0
     best_match: list[int] | None = None
+    template_scale: float = 1.0
 
 
 class Matcher:
@@ -63,6 +64,48 @@ class Matcher:
             len(xloc),
             best_match,
         )
+
+    def match_template_multiscale(
+        self,
+        template,
+        target,
+        matching_threshold=0.45,
+        scales=(1.0,),
+        grouping=True,
+    ):
+        best_result = None
+        for scale in dict.fromkeys(scales):
+            if scale <= 0:
+                raise ValueError("template scales must be greater than zero")
+            width = max(1, round(template.shape[1] * scale))
+            height = max(1, round(template.shape[0] * scale))
+            if width > target.shape[1] or height > target.shape[0]:
+                continue
+            interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+            scaled_template = cv2.resize(
+                template,
+                (width, height),
+                interpolation=interpolation,
+            )
+            result = self.match_template_details(
+                scaled_template,
+                target,
+                matching_threshold,
+                grouping,
+            )
+            scaled_result = TemplateMatchResult(
+                result.matches,
+                result.best_confidence,
+                result.raw_match_count,
+                result.best_match,
+                float(scale),
+            )
+            if best_result is None or scaled_result.best_confidence > best_result.best_confidence:
+                best_result = scaled_result
+
+        if best_result is None:
+            raise ValueError("no template scale fits inside the target image")
+        return best_result
 
     def _suppress_overlaps(self, matches, confidences):
         ranked = sorted(

@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 
 from matcher import Matcher, TemplateMatchResult
@@ -81,6 +82,41 @@ class MatcherTests(unittest.TestCase):
 
         self.assertEqual(result.raw_match_count, 1)
         self.assertEqual(result.best_match, [10, 7, 2, 2])
+
+    def test_multiscale_matching_finds_resized_template_at_screen_coordinates(self):
+        template = np.array(
+            [
+                [3, 40, 7, 90, 12, 63, 5, 31],
+                [70, 8, 55, 2, 84, 18, 46, 9],
+                [6, 95, 21, 74, 11, 38, 82, 4],
+                [44, 13, 67, 25, 91, 3, 52, 78],
+                [19, 86, 1, 58, 34, 73, 16, 49],
+                [92, 24, 61, 10, 80, 29, 65, 14],
+                [35, 76, 17, 88, 6, 54, 27, 69],
+                [81, 15, 47, 33, 71, 20, 96, 8],
+            ],
+            dtype=np.uint8,
+        )
+        scaled = cv2.resize(
+            template,
+            None,
+            fx=1.5,
+            fy=1.5,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        target = np.zeros((60, 60), dtype=np.uint8)
+        target[20:32, 30:42] = scaled
+
+        result = Matcher().match_template_multiscale(
+            template,
+            target,
+            matching_threshold=0.999,
+            scales=(1.0, 1.5),
+        )
+
+        self.assertEqual(result.template_scale, 1.5)
+        self.assertEqual(result.matches, [[36, 26, 12, 12]])
+        self.assertGreaterEqual(result.best_confidence, 0.999)
 
 
 if __name__ == "__main__":

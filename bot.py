@@ -29,10 +29,12 @@ MARKET_MATCHING_THRESHOLD = 0.6
 SOLD_MATCHING_THRESHOLD = 0.6
 NEW_OFFER_MATCHING_THRESHOLD = 0.6
 PLANT_OFFER_MATCHING_THRESHOLD = 0.9
+PLANTING_TOOL_MATCHING_THRESHOLD = 0.7
 NEWSPAPER_MATCHING_THRESHOLD = 0.6
 INSERT_BUTTON_MATCHING_THRESHOLD = 0.9
 SILO_MATCHING_THRESHOLD = 0.9
 CLOSE_MATCHING_THRESHOLD = 0.4
+DETECTION_SCALES = (0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
 
 SCREEN_DIM = {
     'left': 0,
@@ -158,7 +160,12 @@ class Bot:
         return self.m.match_template_exists(field_img, target, FIELD_MATCHING_THRESHOLD)
 
     def check_plants_are_growing(self, target):
-        return self.m.match_template_exists(plant_growing_img, target, WHEAT_GROWING_MATCHING_THRESHOLD)
+        result = self._match_details(
+            plant_growing_img,
+            target,
+            WHEAT_GROWING_MATCHING_THRESHOLD,
+        )
+        return bool(result.matches)
 
     def check_silo_is_full(self, target):
         return len(self.m.match_template(silo_img, target, SILO_MATCHING_THRESHOLD)) > 0
@@ -200,39 +207,112 @@ class Bot:
     def plant_crops(self, target):
         if self._stop_requested():
             return False
-        if self.m.match_template_exists(plant_img, target, WHEAT_MATCHING_THRESHOLD):
-            self.logger.log("Found already grown plants. Harvesting them first...")
+        grown_result = self._match_details(
+            plant_img,
+            target,
+            WHEAT_MATCHING_THRESHOLD,
+        )
+        if grown_result.matches:
+            self._log("PLANT", "grown_wheat_present")
             return False
 
-        cx1, cy1 = self.get_camera_pos(target)
         empty_fields = self.m.match_template(field_img, target, FIELD_MATCHING_THRESHOLD)
-        if len(empty_fields) == 0:
-            self.logger.log("Empty fields gone, retrying...")
-            return False
-        x = empty_fields[0][0]
-        y = empty_fields[0][1]
-        if not self._click((x, y), "PLANT_OPEN", clicks=2):
-            return False
-        if self._wait(2.0):
+        selected_field_match = select_center_match(empty_fields)
+        if selected_field_match is None:
+            self._log("PLANT", "empty_fields_gone")
             return False
 
-        target = self.get_target()
-        cx2, cy2 = self.get_camera_pos(target)
-        translation = (cx1 - cx2, cy1 - cy2)
-        if cx1 == 0 or cx2 == 0:
-            translation = (0, 0)
-            self._log("CAMERA", "plant_stable_fallback", shift=translation)
-        path = self.translate_path(empty_fields, translation)
-        planting_interface = self.m.match_template(planting_interface_img, target, FIELD_MATCHING_THRESHOLD)
-        if len(planting_interface) == 0:
-            self.logger.log("Planting interface not found, retrying...")
+        selected_field = (selected_field_match[0], selected_field_match[1])
+        before_field_centers = self._match_centers(empty_fields)
+        before_anchors = self.get_anchor_positions(target)
+        self._log(
+            "PLANT",
+            "open_tool",
+            matches=len(empty_fields),
+            selected=selected_field,
+        )
+        if not self._click(selected_field, "PLANT_OPEN", clicks=2):
             return False
 
-        drag_start = (planting_interface[0][0], planting_interface[0][1])
-        return self.drag_operation(drag_start, path, target)
+        tool_target, tool_result = self._wait_for_plant_tool()
+        if tool_result is None:
+            if not self._stop_requested() and tool_target is not None:
+                screenshot = self.diagnostics.save_failure(
+                    "plant_tool_timeout",
+                    tool_target,
+                    matches=empty_fields,
+                    selected=selected_field,
+                )
+                self._log(
+                    "WAIT_FOR_PLANT_TOOL",
+                    "timeout",
+                    seconds=self.scythe_timeout,
+                    screenshot=screenshot,
+                )
+            return True
+
+        after_fields = self.m.match_template(
+            field_img,
+            tool_target,
+            FIELD_MATCHING_THRESHOLD,
+        )
+        after_field_centers = self._match_centers(after_fields)
+        after_anchors = self.get_anchor_positions(tool_target)
+        screen_size = (tool_target.shape[1], tool_target.shape[0])
+        translation = estimate_camera_translation(
+            before_anchors,
+            after_anchors,
+            before_field_centers,
+            after_field_centers,
+            screen_size,
+        )
+        translated_fields = translate_points(before_field_centers, translation)
+        translated_selected = translate_points([selected_field], translation)[0]
+        selected_tool_match = select_nearest_match(
+            tool_result.matches,
+            translated_selected,
+        )
+        if selected_tool_match is None or not translated_fields:
+            screenshot = self.diagnostics.save_failure(
+                "invalid_plant_plan",
+                tool_target,
+                matches=tool_result.matches,
+                selected=translated_selected,
+            )
+            self._log("PLANT_PLAN", "invalid", screenshot=screenshot)
+            return True
+
+        tool = (selected_tool_match[0], selected_tool_match[1])
+        route = build_drag_route(translated_fields, tool, max_segment=25)
+        self._log(
+            "PLANT_PLAN",
+            "complete",
+            field_matches=len(empty_fields),
+            tool_matches=len(tool_result.matches),
+            raw_matches=tool_result.raw_match_count,
+            confidence=f"{tool_result.best_confidence:.3f}",
+            template_scale=f"{tool_result.template_scale:.2f}",
+            camera_method=translation.method,
+            shift=(translation.dx, translation.dy),
+            selected=tool,
+            points=len(route),
+        )
+        self._track_harvest_plan(
+            tool_target,
+            tool_result.matches,
+            translated_selected,
+            tool,
+            route,
+        )
+        return self._drag_harvest_route(tool, route, action_state="PLANT")
 
     def _match_details(self, template, target, threshold):
-        return self.m.match_template_details(template, target, threshold)
+        return self.m.match_template_multiscale(
+            template,
+            target,
+            threshold,
+            scales=DETECTION_SCALES,
+        )
 
     @staticmethod
     def _match_centers(matches):
@@ -261,6 +341,7 @@ class Bot:
             grouped_matches=len(result.matches),
             raw_matches=result.raw_match_count,
             confidence=f"{result.best_confidence:.3f}",
+            template_scale=f"{result.template_scale:.2f}",
             threshold=WHEAT_MATCHING_THRESHOLD,
             best_candidate=best_candidate,
             screenshot=screenshot,
@@ -289,6 +370,7 @@ class Bot:
                 matches=len(result.matches),
                 raw_matches=result.raw_match_count,
                 confidence=f"{result.best_confidence:.3f}",
+                template_scale=f"{result.template_scale:.2f}",
                 best_candidate=None
                 if result.best_match is None
                 else tuple(result.best_match[:2]),
@@ -303,17 +385,62 @@ class Bot:
                 return None, None
         return last_target, None
 
-    def _drag_harvest_route(self, scythe, route):
+    def _wait_for_plant_tool(self):
+        deadline = self.clock() + self.scythe_timeout
+        last_target = None
+        while not self._stop_requested():
+            last_target = self.get_target()
+            result = self._match_details(
+                planting_interface_img,
+                last_target,
+                PLANTING_TOOL_MATCHING_THRESHOLD,
+            )
+            self._log(
+                "WAIT_FOR_PLANT_TOOL",
+                "poll",
+                matches=len(result.matches),
+                raw_matches=result.raw_match_count,
+                confidence=f"{result.best_confidence:.3f}",
+                template_scale=f"{result.template_scale:.2f}",
+                best_candidate=None
+                if result.best_match is None
+                else tuple(result.best_match[:2]),
+            )
+            if result.matches:
+                return last_target, result
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                break
+            if self._wait(min(self.scythe_poll_interval, remaining)):
+                return None, None
+        return last_target, None
+
+    def _drag_harvest_route(self, scythe, route, action_state="HARVEST"):
         if self._stop_requested():
             return False
-        self._log("INPUT", "move_to_scythe", point=scythe)
+        move_message = (
+            "move_to_plant_tool"
+            if action_state == "PLANT"
+            else "move_to_scythe"
+        )
+        self._log(
+            "INPUT",
+            move_message,
+            action_state=action_state,
+            point=scythe,
+        )
         self.mouse.moveTo(scythe[0], scythe[1])
         if self._stop_requested():
             return False
 
         mouse_is_down = False
         try:
-            self._log("INPUT", "mouse_down", point=scythe)
+            self._log(
+                "INPUT",
+                "mouse_down",
+                action_state=action_state,
+                point=scythe,
+            )
             self.mouse.mouseDown(button="left")
             mouse_is_down = True
             for point in route:
@@ -329,7 +456,7 @@ class Bot:
         finally:
             if mouse_is_down:
                 self.mouse.mouseUp(button="left")
-                self._log("INPUT", "mouse_up")
+                self._log("INPUT", "mouse_up", action_state=action_state)
 
     def _track_harvest_plan(self, target, matches, selected, scythe, path):
         tracked = target.copy()
@@ -358,6 +485,7 @@ class Bot:
             matches=len(wheat_result.matches),
             raw_matches=wheat_result.raw_match_count,
             confidence=f"{wheat_result.best_confidence:.3f}",
+            template_scale=f"{wheat_result.template_scale:.2f}",
             best_candidate=None
             if wheat_result.best_match is None
             else tuple(wheat_result.best_match[:2]),
@@ -440,6 +568,7 @@ class Bot:
             scythe_matches=len(scythe_result.matches),
             raw_matches=scythe_result.raw_match_count,
             confidence=f"{scythe_result.best_confidence:.3f}",
+            template_scale=f"{scythe_result.template_scale:.2f}",
             candidates=self._match_centers(scythe_result.matches),
             selected=scythe,
             points=len(route),
@@ -633,8 +762,13 @@ class Bot:
                 self.track_matches(empty_fields, screen)
                 if empty_fields:
                     self._log("PLANT", "empty_fields", matches=len(empty_fields))
-                    self.plant_crops(screen)
-                    self.planted_crops += len(empty_fields)
+                    screen_changed = self.plant_crops(screen)
+                    if screen_changed:
+                        self.planted_crops += len(empty_fields)
+                        self._log("PLANT", "screen_changed_rescan_required")
+                        if self._wait(0.5):
+                            break
+                        continue
                 if self._stop_requested():
                     break
 
@@ -659,6 +793,7 @@ class Bot:
                             matches=len(grown_result.matches),
                             raw_matches=grown_result.raw_match_count,
                             confidence=f"{grown_result.best_confidence:.3f}",
+                            template_scale=f"{grown_result.template_scale:.2f}",
                         )
                         self.harvest_plants(screen)
                     else:
