@@ -226,6 +226,28 @@ class FakeMouse:
         return 1920, 1080
 
 
+class TimedFakeMouse(FakeMouse):
+    def __init__(self, clock):
+        super().__init__()
+        self.clock = clock
+        self.button_down_at = None
+        self.button_hold_seconds = []
+
+    def moveTo(self, x, y, **kwargs):
+        super().moveTo(x, y, **kwargs)
+        duration = kwargs.get("duration", 0)
+        if self.button_down and duration > bot_module.pa.MINIMUM_DURATION:
+            self.clock.now += duration
+
+    def mouseDown(self, button="left"):
+        super().mouseDown(button)
+        self.button_down_at = self.clock.now
+
+    def mouseUp(self, button="left"):
+        self.button_hold_seconds.append(self.clock.now - self.button_down_at)
+        super().mouseUp(button)
+
+
 class FakeTime:
     def __init__(self):
         self.now = 0.0
@@ -276,6 +298,30 @@ def make_harvest_bot(screens, timeout=4.0, stop_on_wait=False, raise_on_drag=Fal
 
 
 class BotHarvestTests(unittest.TestCase):
+    def test_plant_drag_holds_mouse_long_enough_to_register_as_a_gesture(self):
+        clock = FakeTime()
+        mouse = TimedFakeMouse(clock)
+        planting_bot = bot_module.Bot(
+            FakeLogger(),
+            lambda image: None,
+            mouse=mouse,
+            key_state=lambda key: False,
+            diagnostics=FakeDiagnostics(),
+            matcher=FakeMatcher(),
+            clock=clock.monotonic,
+            waiter=clock.wait,
+        )
+
+        result = planting_bot._drag_harvest_route(
+            (100, 100),
+            [(120, 120), (140, 140)],
+            action_state="PLANT",
+        )
+
+        self.assertTrue(result)
+        self.assertGreaterEqual(mouse.button_hold_seconds[-1], 0.6)
+        self.assertFalse(mouse.button_down)
+
     def test_bot_loop_rescans_after_planting_before_harvest_detection(self):
         capture = SequenceCapture([EMPTY_FIELD_SCREEN, PLANT_TOOL_SCREEN])
         mouse = FakeMouse()

@@ -89,7 +89,9 @@ class Bot:
         self._loop_lock = Lock()
         self.scythe_timeout = 4.0
         self.scythe_poll_interval = 0.2
-        self.drag_point_duration = 0.1
+        self.drag_press_hold = 0.25
+        self.drag_point_duration = 0.15
+        self.drag_release_hold = 0.1
         self._wheat_scan_saved = False
         self.silo_is_full = False
         self.harvested_plants = False
@@ -434,15 +436,21 @@ class Bot:
             return False
 
         mouse_is_down = False
+        mouse_down_at = None
         try:
             self._log(
                 "INPUT",
                 "mouse_down",
                 action_state=action_state,
                 point=scythe,
+                press_hold=self.drag_press_hold,
+                point_duration=self.drag_point_duration,
             )
             self.mouse.mouseDown(button="left")
             mouse_is_down = True
+            mouse_down_at = self.clock()
+            if self._wait(self.drag_press_hold):
+                return False
             for point in route:
                 if self._stop_requested():
                     return False
@@ -452,11 +460,19 @@ class Bot:
                     duration=self.drag_point_duration,
                     _pause=False,
                 )
+            if self._wait(self.drag_release_hold):
+                return False
             return True
         finally:
             if mouse_is_down:
                 self.mouse.mouseUp(button="left")
-                self._log("INPUT", "mouse_up", action_state=action_state)
+                held_seconds = self.clock() - mouse_down_at
+                self._log(
+                    "INPUT",
+                    "mouse_up",
+                    action_state=action_state,
+                    held_seconds=f"{held_seconds:.3f}",
+                )
 
     def _track_harvest_plan(self, target, matches, selected, scythe, path):
         tracked = target.copy()
