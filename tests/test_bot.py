@@ -347,7 +347,7 @@ class BotHarvestTests(unittest.TestCase):
         no_wheat_logs = [message for state, message, _ in diagnostics.logs if state == "HARVEST"]
         self.assertNotIn("wheat_not_detected", no_wheat_logs)
 
-    def test_planting_uses_center_field_nearest_tool_and_real_field_route(self):
+    def test_planting_opens_center_field_and_uses_nearest_tool(self):
         capture = SequenceCapture([PLANT_TOOL_SCREEN])
         mouse = FakeMouse()
         clock = FakeTime()
@@ -369,9 +369,6 @@ class BotHarvestTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(mouse.calls[0], ("click", 550, 500))
         self.assertIn(("moveTo", 560, 430), mouse.calls)
-        self.assertIn(("moveTo", 500, 500), mouse.calls)
-        self.assertIn(("moveTo", 550, 500), mouse.calls)
-        self.assertIn(("moveTo", 600, 500), mouse.calls)
         self.assertEqual(mouse.calls[-1], ("mouseUp", "left"))
         plan_logs = [fields for state, _, fields in diagnostics.logs if state == "PLANT_PLAN"]
         self.assertEqual(plan_logs[-1]["template_scale"], "1.50")
@@ -384,6 +381,37 @@ class BotHarvestTests(unittest.TestCase):
             ("move_to_plant_tool", {"action_state": "PLANT", "point": (560, 430)}),
             input_logs,
         )
+
+    def test_planting_sweeps_the_full_detected_field_area_with_one_hold(self):
+        capture = SequenceCapture([PLANT_TOOL_SCREEN])
+        mouse = FakeMouse()
+        clock = FakeTime()
+        diagnostics = FakeDiagnostics()
+        planting_bot = bot_module.Bot(
+            FakeLogger(),
+            lambda image: None,
+            capture=capture,
+            mouse=mouse,
+            key_state=lambda key: False,
+            diagnostics=diagnostics,
+            matcher=AdaptivePlantMatcher(),
+            clock=clock.monotonic,
+            waiter=clock.wait,
+        )
+
+        result = planting_bot.plant_crops(EMPTY_FIELD_SCREEN)
+
+        self.assertTrue(result)
+        move_points = [call[1:] for call in mouse.calls if call[0] == "moveTo"]
+        self.assertIn((490, 490), move_points)
+        self.assertIn((610, 490), move_points)
+        self.assertIn((490, 510), move_points)
+        self.assertIn((610, 510), move_points)
+        self.assertEqual(mouse.calls.count(("mouseDown", "left")), 1)
+        self.assertEqual(mouse.calls.count(("mouseUp", "left")), 1)
+        plan_logs = [fields for state, _, fields in diagnostics.logs if state == "PLANT_PLAN"]
+        self.assertEqual(plan_logs[-1]["sweep_bounds"], (490, 490, 610, 510))
+        self.assertEqual(plan_logs[-1]["sweep_rows"], 3)
 
     def test_no_wheat_report_saves_best_candidate_and_match_evidence_once(self):
         harvest_bot, _, _, diagnostics = make_harvest_bot([NO_SCYTHE_SCREEN])

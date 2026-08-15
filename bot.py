@@ -5,6 +5,7 @@ from diagnostics import Diagnostics
 from matcher import Matcher
 from planner import (
     build_drag_route,
+    build_field_sweep_plan,
     estimate_camera_translation,
     select_center_match,
     select_nearest_match,
@@ -269,6 +270,15 @@ class Bot:
             screen_size,
         )
         translated_fields = translate_points(before_field_centers, translation)
+        translated_field_matches = [
+            [
+                match[0] + translation.dx,
+                match[1] + translation.dy,
+                match[2],
+                match[3],
+            ]
+            for match in empty_fields
+        ]
         translated_selected = translate_points([selected_field], translation)[0]
         selected_tool_match = select_nearest_match(
             tool_result.matches,
@@ -285,7 +295,8 @@ class Bot:
             return True
 
         tool = (selected_tool_match[0], selected_tool_match[1])
-        route = build_drag_route(translated_fields, tool, max_segment=25)
+        sweep_plan = build_field_sweep_plan(translated_field_matches, tool)
+        route = sweep_plan.route
         self._log(
             "PLANT_PLAN",
             "complete",
@@ -297,6 +308,8 @@ class Bot:
             camera_method=translation.method,
             shift=(translation.dx, translation.dy),
             selected=tool,
+            sweep_bounds=sweep_plan.bounds,
+            sweep_rows=sweep_plan.rows,
             points=len(route),
         )
         self._track_harvest_plan(

@@ -17,6 +17,13 @@ class CameraTranslation:
     confidence: str
 
 
+@dataclass(frozen=True)
+class FieldSweepPlan:
+    bounds: tuple[int, int, int, int]
+    rows: int
+    route: list[Point]
+
+
 def _distance_squared(first: Point, second: Point) -> int:
     return (first[0] - second[0]) ** 2 + (first[1] - second[1]) ** 2
 
@@ -153,3 +160,50 @@ def build_drag_route(
         current = next_crop
         remaining.remove(next_crop)
     return route
+
+
+def build_field_sweep_plan(
+    field_matches: Sequence[Match],
+    start: Point,
+) -> FieldSweepPlan:
+    if not field_matches:
+        return FieldSweepPlan((0, 0, 0, 0), 0, [])
+
+    left = round(min(match[0] - match[2] / 2 for match in field_matches))
+    top = round(min(match[1] - match[3] / 2 for match in field_matches))
+    right = round(max(match[0] + match[2] / 2 for match in field_matches))
+    bottom = round(max(match[1] + match[3] / 2 for match in field_matches))
+
+    typical_height = max(1, round(median(match[3] for match in field_matches)))
+    maximum_row_gap = max(1, round(typical_height / 2))
+    row_intervals = max(1, ceil((bottom - top) / maximum_row_gap))
+    row_positions = [
+        round(top + (bottom - top) * index / row_intervals)
+        for index in range(row_intervals + 1)
+    ]
+
+    top_distance = min(
+        _distance_squared(start, (left, top)),
+        _distance_squared(start, (right, top)),
+    )
+    bottom_distance = min(
+        _distance_squared(start, (left, bottom)),
+        _distance_squared(start, (right, bottom)),
+    )
+    if bottom_distance < top_distance:
+        row_positions.reverse()
+
+    first_y = row_positions[0]
+    left_to_right = _distance_squared(start, (left, first_y)) <= _distance_squared(
+        start,
+        (right, first_y),
+    )
+    route = []
+    for row_index, y in enumerate(row_positions):
+        move_left_to_right = left_to_right if row_index % 2 == 0 else not left_to_right
+        if move_left_to_right:
+            route.extend([(left, y), (right, y)])
+        else:
+            route.extend([(right, y), (left, y)])
+
+    return FieldSweepPlan((left, top, right, bottom), len(row_positions), route)
