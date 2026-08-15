@@ -88,6 +88,7 @@ class Bot:
         self.scythe_timeout = 4.0
         self.scythe_poll_interval = 0.2
         self.drag_point_duration = 0.1
+        self._wheat_scan_saved = False
         self.silo_is_full = False
         self.harvested_plants = False
         self.planted_crops = 0
@@ -237,6 +238,34 @@ class Bot:
     def _match_centers(matches):
         return [(match[0], match[1]) for match in matches]
 
+    def _report_no_wheat(self, target, result):
+        best_candidate = None
+        best_matches = []
+        if result.best_match is not None:
+            best_candidate = (result.best_match[0], result.best_match[1])
+            best_matches = [result.best_match]
+
+        screenshot = None
+        if not self._wheat_scan_saved:
+            screenshot = self.diagnostics.save_failure(
+                "wheat_not_detected",
+                target,
+                matches=best_matches,
+                selected=best_candidate,
+            )
+            self._wheat_scan_saved = True
+
+        self._log(
+            "HARVEST",
+            "wheat_not_detected",
+            grouped_matches=len(result.matches),
+            raw_matches=result.raw_match_count,
+            confidence=f"{result.best_confidence:.3f}",
+            threshold=WHEAT_MATCHING_THRESHOLD,
+            best_candidate=best_candidate,
+            screenshot=screenshot,
+        )
+
     def _click(self, point, state, **kwargs):
         if self._stop_requested():
             return False
@@ -258,7 +287,11 @@ class Bot:
                 "WAIT_FOR_SCYTHE",
                 "poll",
                 matches=len(result.matches),
+                raw_matches=result.raw_match_count,
                 confidence=f"{result.best_confidence:.3f}",
+                best_candidate=None
+                if result.best_match is None
+                else tuple(result.best_match[:2]),
                 candidates=self._match_centers(result.matches),
             )
             if result.matches:
@@ -323,7 +356,11 @@ class Bot:
             "DETECT_WHEAT",
             "complete",
             matches=len(wheat_result.matches),
+            raw_matches=wheat_result.raw_match_count,
             confidence=f"{wheat_result.best_confidence:.3f}",
+            best_candidate=None
+            if wheat_result.best_match is None
+            else tuple(wheat_result.best_match[:2]),
             candidates=self._match_centers(wheat_result.matches),
             selected=None if selected_match is None else tuple(selected_match[:2]),
         )
@@ -401,6 +438,7 @@ class Bot:
             "PLAN_DRAG",
             "complete",
             scythe_matches=len(scythe_result.matches),
+            raw_matches=scythe_result.raw_match_count,
             confidence=f"{scythe_result.best_confidence:.3f}",
             candidates=self._match_centers(scythe_result.matches),
             selected=scythe,
@@ -619,11 +657,12 @@ class Bot:
                             "HARVEST",
                             "grown_plants",
                             matches=len(grown_result.matches),
+                            raw_matches=grown_result.raw_match_count,
                             confidence=f"{grown_result.best_confidence:.3f}",
                         )
                         self.harvest_plants(screen)
                     else:
-                        self._log("HARVEST", "waiting_for_growth")
+                        self._report_no_wheat(screen, grown_result)
                         if self._wait(10.0):
                             break
 

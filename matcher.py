@@ -11,6 +11,8 @@ from math import dist
 class TemplateMatchResult:
     matches: list[list[int]]
     best_confidence: float
+    raw_match_count: int = 0
+    best_match: list[int] | None = None
 
 
 class Matcher:
@@ -35,25 +37,67 @@ class Matcher:
         grouping=True,
     ):
         result = cv2.matchTemplate(target, template, cv2.TM_CCOEFF_NORMED)
-        _, best_confidence, _, _ = cv2.minMaxLoc(result)
+        _, best_confidence, _, best_location = cv2.minMaxLoc(result)
         w = template.shape[1]
         h = template.shape[0]
         yloc, xloc = np.where(result >= matching_threshold)
 
         matches = []
+        confidences = []
         for (x, y) in zip(xloc, yloc):
             matches.append([int(x + w / 2), int(y + h / 2), int(w), int(h)])
+            confidences.append(float(result[y, x]))
 
         if grouping and matches:
-            group_rectangles = getattr(cv2, "groupRectangles", None)
-            if group_rectangles is not None:
-                matches, _ = group_rectangles(
-                    matches,
-                    self.group_threshold,
-                    self.eps,
-                )
+            matches = self._suppress_overlaps(matches, confidences)
         normalized_matches = [list(map(int, match)) for match in matches]
-        return TemplateMatchResult(normalized_matches, float(best_confidence))
+        best_match = [
+            int(best_location[0] + w / 2),
+            int(best_location[1] + h / 2),
+            int(w),
+            int(h),
+        ]
+        return TemplateMatchResult(
+            normalized_matches,
+            float(best_confidence),
+            len(xloc),
+            best_match,
+        )
+
+    def _suppress_overlaps(self, matches, confidences):
+        ranked = sorted(
+            zip(matches, confidences),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        selected = []
+        for candidate, _ in ranked:
+            if all(
+                self._intersection_over_union(candidate, existing) <= self.eps
+                for existing in selected
+            ):
+                selected.append(candidate)
+        return selected
+
+    @staticmethod
+    def _intersection_over_union(first, second):
+        first_left = first[0] - first[2] / 2
+        first_top = first[1] - first[3] / 2
+        first_right = first[0] + first[2] / 2
+        first_bottom = first[1] + first[3] / 2
+        second_left = second[0] - second[2] / 2
+        second_top = second[1] - second[3] / 2
+        second_right = second[0] + second[2] / 2
+        second_bottom = second[1] + second[3] / 2
+
+        intersection_width = max(0, min(first_right, second_right) - max(first_left, second_left))
+        intersection_height = max(0, min(first_bottom, second_bottom) - max(first_top, second_top))
+        intersection = intersection_width * intersection_height
+        if intersection == 0:
+            return 0.0
+        first_area = first[2] * first[3]
+        second_area = second[2] * second[3]
+        return intersection / (first_area + second_area - intersection)
 
     def match_template_exists(self, template, target, matching_threshold=0.45):
         result = cv2.matchTemplate(target, template, cv2.TM_CCOEFF_NORMED)

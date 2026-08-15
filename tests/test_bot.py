@@ -63,10 +63,20 @@ class FakeMatcher:
         marker = int(target[0, 0, 0])
         if template is bot_module.plant_img:
             matches = [self.wheat_match] if marker in (1, 3) else []
-            return TemplateMatchResult(matches, 0.95 if matches else 0.1)
+            return TemplateMatchResult(
+                matches,
+                0.95 if matches else 0.1,
+                len(matches),
+                self.wheat_match,
+            )
         if template is bot_module.harvesting_interface_img:
             matches = self.scythe_matches if marker == 3 else []
-            return TemplateMatchResult(matches, 0.92 if matches else 0.2)
+            return TemplateMatchResult(
+                matches,
+                0.92 if matches else 0.2,
+                len(matches),
+                self.scythe_matches[1],
+            )
         if template is bot_module.boat_img or template is bot_module.market_img:
             return TemplateMatchResult([], 0.1)
         return TemplateMatchResult([], 0.0)
@@ -169,6 +179,27 @@ def make_harvest_bot(screens, timeout=4.0, stop_on_wait=False, raise_on_drag=Fal
 
 
 class BotHarvestTests(unittest.TestCase):
+    def test_no_wheat_report_saves_best_candidate_and_match_evidence_once(self):
+        harvest_bot, _, _, diagnostics = make_harvest_bot([NO_SCYTHE_SCREEN])
+        result = TemplateMatchResult(
+            matches=[],
+            best_confidence=0.274,
+            raw_match_count=3,
+            best_match=[620, 410, 55, 35],
+        )
+
+        harvest_bot._report_no_wheat(NO_SCYTHE_SCREEN, result)
+        harvest_bot._report_no_wheat(NO_SCYTHE_SCREEN, result)
+
+        reports = [fields for state, _, fields in diagnostics.logs if state == "HARVEST"]
+        self.assertEqual(reports[-1]["grouped_matches"], 0)
+        self.assertEqual(reports[-1]["raw_matches"], 3)
+        self.assertEqual(reports[-1]["confidence"], "0.274")
+        self.assertEqual(reports[-1]["best_candidate"], (620, 410))
+        self.assertEqual(len(diagnostics.failures), 1)
+        self.assertEqual(diagnostics.failures[0]["reason"], "wheat_not_detected")
+        self.assertEqual(diagnostics.failures[0]["matches"], [[620, 410, 55, 35]])
+
     def test_planting_does_not_capture_or_click_after_stop(self):
         capture = SequenceCapture([NO_SCYTHE_SCREEN])
         mouse = FakeMouse()
@@ -211,6 +242,10 @@ class BotHarvestTests(unittest.TestCase):
         camera_logs = [fields for state, _, fields in diagnostics.logs if state == "CAMERA"]
         self.assertEqual(camera_logs[-1]["method"], "crop_positions")
         self.assertEqual(camera_logs[-1]["shift"], (0, 0))
+        wheat_logs = [fields for state, _, fields in diagnostics.logs if state == "DETECT_WHEAT"]
+        scythe_logs = [fields for state, _, fields in diagnostics.logs if state == "WAIT_FOR_SCYTHE"]
+        self.assertEqual(wheat_logs[-1]["raw_matches"], 1)
+        self.assertEqual(scythe_logs[-1]["raw_matches"], 2)
 
     def test_harvest_waits_until_scythe_appears(self):
         harvest_bot, mouse, capture, _ = make_harvest_bot(

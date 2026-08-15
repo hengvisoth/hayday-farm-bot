@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -45,6 +46,41 @@ class MatcherTests(unittest.TestCase):
 
         self.assertIsInstance(matches, list)
         self.assertIn([10, 7, 2, 2], matches)
+
+    def test_grouping_keeps_one_isolated_valid_match(self):
+        target = np.zeros((20, 20), dtype=np.uint8)
+        template = np.array([[1, 2], [3, 7]], dtype=np.uint8)
+        target[6:8, 9:11] = template
+
+        with patch.object(
+            __import__("matcher").cv2,
+            "groupRectangles",
+            return_value=([], []),
+            create=True,
+        ):
+            result = Matcher().match_template_details(
+                template,
+                target,
+                matching_threshold=0.999,
+                grouping=True,
+            )
+
+        self.assertEqual(result.matches, [[10, 7, 2, 2]])
+
+    def test_match_details_report_raw_count_and_best_location(self):
+        target = np.zeros((20, 20), dtype=np.uint8)
+        template = np.array([[1, 2], [3, 7]], dtype=np.uint8)
+        target[6:8, 9:11] = template
+
+        result = Matcher().match_template_details(
+            template,
+            target,
+            matching_threshold=0.999,
+            grouping=True,
+        )
+
+        self.assertEqual(result.raw_match_count, 1)
+        self.assertEqual(result.best_match, [10, 7, 2, 2])
 
 
 if __name__ == "__main__":
