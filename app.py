@@ -4,6 +4,7 @@ import cv2
 
 from PIL import Image
 from bot import Bot
+from queue import Empty, Full, Queue
 from threading import Thread
 
 customtkinter.set_appearance_mode("dark")
@@ -20,18 +21,54 @@ screen_dim = {
 class Logger(customtkinter.CTkTextbox):
     def __init__(self, master, **kwargs):
         super().__init__(master, **kwargs)
+        self.messages = Queue()
         self.grid(row=0, column=0, sticky="nsew")
 
     def log(self, *message):
+        self.messages.put(" ".join(map(str, message)))
+
+    def drain(self):
+        lines = []
+        while True:
+            try:
+                lines.append(self.messages.get_nowait())
+            except Empty:
+                break
+        if not lines:
+            return
         self.configure(state="normal")
-        self.insert("0.0", " ".join(map(lambda m: str(m), message)) + "\n")
+        for line in lines:
+            self.insert("end", line + "\n")
+        self.see("end")
         self.configure(state="disabled")
+
+
+class WorkerController:
+    def __init__(self, bot, thread_factory=Thread):
+        self.bot = bot
+        self.thread_factory = thread_factory
+        self.thread = None
+
+    def is_running(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def start(self):
+        if self.is_running():
+            return False
+        self.bot.reset_stop()
+        self.thread = self.thread_factory(target=self.bot.bot_loop, daemon=True)
+        self.thread.start()
+        return True
+
+    def stop(self):
+        self.bot.request_stop()
 
 
 class App(customtkinter.CTk):
     def __init__(self):
         super().__init__()
-        self.sct = mss.mss()
+        self.sct = mss.MSS()
+        self.preview_queue = Queue(maxsize=1)
 
         # configure window
         self.title("Hay Day Farm Bot")
@@ -70,7 +107,9 @@ class App(customtkinter.CTk):
 
         # bot
         self.bot = Bot(self.logger, self.set_tracking_img)
-        self.bot_thread = None
+        self.worker = WorkerController(self.bot)
+        self.protocol("WM_DELETE_WINDOW", self.close_app)
+        self.after(50, self._drain_ui_queues)
 
     def update_screen(self):
         data = self.sct.grab(screen_dim)
@@ -79,26 +118,62 @@ class App(customtkinter.CTk):
         self.tracking_image_label.image = tracking_image
 
     def set_tracking_img(self, cv2_data):
-        data = cv2.cvtColor(cv2_data, cv2.COLOR_RGB2BGR)
-        tracking_image = customtkinter.CTkImage(Image.fromarray(data), size=(790, 450))
+        try:
+            self.preview_queue.put_nowait(cv2_data.copy())
+        except Full:
+            try:
+                self.preview_queue.get_nowait()
+            except Empty:
+                pass
+            self.preview_queue.put_nowait(cv2_data.copy())
+
+    def _apply_tracking_img(self, cv2_data):
+        if len(cv2_data.shape) == 3 and cv2_data.shape[2] == 4:
+            data = cv2.cvtColor(cv2_data, cv2.COLOR_BGRA2RGB)
+        else:
+            data = cv2.cvtColor(cv2_data, cv2.COLOR_BGR2RGB)
+        tracking_image = customtkinter.CTkImage(
+            Image.fromarray(data),
+            size=(790, 450),
+        )
         self.tracking_image_label.configure(image=tracking_image)
         self.tracking_image_label.image = tracking_image
 
+    def _drain_ui_queues(self):
+        self.logger.drain()
+        latest_image = None
+        while True:
+            try:
+                latest_image = self.preview_queue.get_nowait()
+            except Empty:
+                break
+        if latest_image is not None:
+            self._apply_tracking_img(latest_image)
+        if not self.worker.is_running():
+            self.start_button.configure(state="normal")
+            self.stop_button.configure(state="disabled")
+        self.after(50, self._drain_ui_queues)
+
     def start_button_click(self):
-        self.logger.log("Start")
-        self.start_button.configure(state="disabled")
-        self.stop_button.configure(state="normal")
-        self.start_bot()
+        if self.start_bot():
+            self.logger.log("Start")
+            self.start_button.configure(state="disabled")
+            self.stop_button.configure(state="normal")
+        else:
+            self.logger.log("Start ignored: bot is already running")
 
     def stop_button_click(self):
         self.logger.log("Stop")
-        self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self.stop_bot()
 
     def start_bot(self):
-        self.bot_thread = Thread(target=self.bot.bot_loop)
-        self.bot_thread.start()
+        return self.worker.start()
 
     def stop_bot(self):
-        self.bot_thread = None
+        self.worker.stop()
+
+    def close_app(self):
+        self.worker.stop()
+        self.sct.close()
+        self.destroy()
