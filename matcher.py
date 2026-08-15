@@ -1,9 +1,16 @@
 import math
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
 from math import dist
+
+
+@dataclass(frozen=True)
+class TemplateMatchResult:
+    matches: list[list[int]]
+    best_confidence: float
 
 
 class Matcher:
@@ -13,7 +20,22 @@ class Matcher:
         self.eps = eps
 
     def match_template(self, template, target, matching_threshold=0.45, grouping=True):
+        return self.match_template_details(
+            template,
+            target,
+            matching_threshold,
+            grouping,
+        ).matches
+
+    def match_template_details(
+        self,
+        template,
+        target,
+        matching_threshold=0.45,
+        grouping=True,
+    ):
         result = cv2.matchTemplate(target, template, cv2.TM_CCOEFF_NORMED)
+        _, best_confidence, _, _ = cv2.minMaxLoc(result)
         w = template.shape[1]
         h = template.shape[0]
         yloc, xloc = np.where(result >= matching_threshold)
@@ -22,9 +44,16 @@ class Matcher:
         for (x, y) in zip(xloc, yloc):
             matches.append([int(x + w / 2), int(y + h / 2), int(w), int(h)])
 
-        if grouping:
-            matches, _ = cv2.groupRectangles(matches, self.group_threshold, self.eps)
-        return matches
+        if grouping and matches:
+            group_rectangles = getattr(cv2, "groupRectangles", None)
+            if group_rectangles is not None:
+                matches, _ = group_rectangles(
+                    matches,
+                    self.group_threshold,
+                    self.eps,
+                )
+        normalized_matches = [list(map(int, match)) for match in matches]
+        return TemplateMatchResult(normalized_matches, float(best_confidence))
 
     def match_template_exists(self, template, target, matching_threshold=0.45):
         result = cv2.matchTemplate(target, template, cv2.TM_CCOEFF_NORMED)
@@ -73,4 +102,3 @@ class Matcher:
                 cv2.line(target, before, p, (0, 0, 0), 2)
             cv2.circle(target, p, 2, (0, 0, 255), 2)
             before = p
-
