@@ -5,3 +5,4 @@ numpy
 opencv-python==4.13.0.92
 Pillow
 PyAutoGUI
+pytesseract

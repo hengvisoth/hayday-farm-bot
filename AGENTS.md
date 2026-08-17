@@ -57,7 +57,7 @@ Matches are stored as:
 
 `Matcher.match_template()` can group nearby results. The bot uses the results for clicks and drag paths.
 
-The boat and market images are camera anchors. They help adjust a field path after the game camera moves.
+The boat and market images are camera anchors, logged for diagnostics. Field and wheat routes are not adjusted through them — after a click, the bot re-detects the field/wheat tiles fresh on the new screen instead of translating pre-click positions, so a shifted camera never produces a stale plan.
 
 ## Templates
 
@@ -69,13 +69,17 @@ Template folders have these roles:
 
 Template images depend on the game's scale, screen resolution, graphics, and camera position. If detection fails, first check the template image and its threshold.
 
+All templates load through `_load_template()` in `bot.py`, which converts them to 4-channel BGRA if needed. `mss` screen captures are always BGRA, and `cv2.matchTemplate` requires the template and target to share a channel count -- a template re-saved by an image editor without an alpha channel would otherwise crash `matchTemplate` (not just fail to match) the moment it's used. Always add new templates through `_load_template()`, not a raw `cv2.imread()`.
+
 ## Setup
 
 Use Python 3. Install these packages:
 
 ```bash
-python -m pip install numpy opencv-python customtkinter mss pillow keyboard pyautogui
+python -m pip install numpy opencv-python customtkinter mss pillow keyboard pyautogui pytesseract
 ```
+
+`pytesseract` is a wrapper only -- it also needs the Tesseract-OCR engine installed separately (`winget install --id UB-Mannheim.TesseractOCR -e` on Windows). `bot.py` points `pytesseract.pytesseract.tesseract_cmd` at `C:\Program Files\Tesseract-OCR\tesseract.exe` if that path exists; otherwise it relies on `tesseract` being on `PATH`.
 
 The repository has no dependency lock file or package metadata.
 
@@ -105,7 +109,7 @@ For changes to image matching:
 ## Important Assumptions
 
 - The captured screen starts at `(0, 0)`.
-- The screen size is fixed at 1920 x 1080.
+- The screen size is detected at startup from the primary display (`pyautogui.size()`), not hardcoded.
 - Mouse coordinates use the same coordinate system as captured images.
 - The game is visible and not covered by another window.
 - The game scale and graphics look like the saved templates.
@@ -114,7 +118,7 @@ For changes to image matching:
 
 ## Current Limits
 
-- The bot uses fixed screen dimensions and several fixed anchor values.
+- Screen capture size is detected, but `BOAT_ANCHOR`/`MARKET_ANCHOR` and the saved templates are still tuned for a 1920 x 1080 layout. Running at another resolution can still misalign camera-position estimation and matching.
 - There is no configuration file or command-line interface.
 - There are no automated tests.
 - Image files are loaded when `bot.py` is imported. Missing files can cause later matching errors.

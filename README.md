@@ -15,9 +15,10 @@ The bot captures the screen, finds game objects with OpenCV, and controls the mo
 - Searches several template scales for different game zoom and display sizes.
 - Works without boat or market anchors when the game view stays stable.
 - Drags through detected wheat centers instead of a large fixed boundary.
-- Plants through actual empty-field centers and rescans before harvesting.
+- Plants by clicking the field to reveal the wheat tool, then holding it and dragging through every detected field tile in one motion.
 - Detects a full silo.
 - Collects sold items and creates new market offers.
+- Collects money from the roadside stand and restocks it with wheat once the OCR'd quantity exceeds a threshold.
 - Uses image templates instead of fixed positions for most actions.
 - Shows detection results and status messages in a desktop window.
 - Writes detailed session logs and failure screenshots.
@@ -25,8 +26,8 @@ The bot captures the screen, finds game objects with OpenCV, and controls the mo
 ## Requirements
 
 - Python 3
+- [Tesseract-OCR](https://github.com/UB-Mannheim/tesseract/wiki) installed (used to read the wheat quantity badge before restocking the roadside stand). On Windows: `winget install --id UB-Mannheim.TesseractOCR -e`. `bot.py` looks for it at `C:\Program Files\Tesseract-OCR\tesseract.exe` by default; if it's installed elsewhere, set `pytesseract.pytesseract.tesseract_cmd` yourself or add the install directory to `PATH`.
 - A visible Hay Day game window
-- A 1920 x 1080 screen layout
 - Permission to capture the screen and control the mouse and keyboard
 
 The current templates and coordinates depend on the game scale, graphics, camera position, and screen resolution used when they were created.
@@ -90,10 +91,11 @@ The bot repeats this process:
 4. Sell wheat after a harvest or when the silo is full.
 5. Click a wheat crop near the center of the detected crop group.
 6. Poll for the scythe for up to four seconds.
-7. Estimate camera movement from a shared anchor or crop movement.
-8. Use zero movement when no reliable movement evidence exists.
-9. Press the nearest scythe and drag through detected wheat centers.
-10. Wait and repeat.
+7. Re-detect wheat fresh on the post-click screen (never reuse pre-click positions, so a shifted camera can't produce a stale plan).
+8. Reject a scythe/tool match that's implausibly far from the click instead of dragging to it.
+9. Look for the game's own "selected" marker (`field_selected.png` / `wheat_selected.png`) to anchor the sweep on the exact tile that was clicked, falling back to the detected group's center if the marker isn't visible.
+10. Hold the nearest scythe and drag row by row through every detected wheat tile, starting from that anchor.
+11. Wait and repeat.
 
 The bot does not click a generic close button after every loop. Recovery clicks only run for a known failure.
 
@@ -150,7 +152,7 @@ When reporting a new problem, send the latest session log and failure screenshot
 ## Current Limits
 
 - Only the wheat farming flow is supported.
-- Screen capture is fixed to 1920 x 1080.
+- Screen capture size is detected from the primary display at startup, but camera anchors and templates are still tuned for a 1920 x 1080 layout.
 - Templates still depend on the game scale and display setup.
 - Template matching can produce false matches.
 - Recovery from unexpected game states is limited.
