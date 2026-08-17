@@ -1,15 +1,13 @@
+import os
 from threading import Event, Lock
 from time import monotonic
 
 from diagnostics import Diagnostics
 from matcher import Matcher
 from planner import (
-    build_drag_route,
-    build_field_sweep_plan,
-    estimate_camera_translation,
-    select_center_match,
+    build_field_route,
+    select_field_center,
     select_nearest_match,
-    translate_points,
 )
 
 import cv2
@@ -17,12 +15,22 @@ import numpy as np
 import mss
 import keyboard
 import pyautogui as pa
+import pytesseract
 
 pa.PAUSE = 0
 
+_DEFAULT_TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if os.path.exists(_DEFAULT_TESSERACT_PATH):
+    pytesseract.pytesseract.tesseract_cmd = _DEFAULT_TESSERACT_PATH
+
 # Preparation
 FIELD_MATCHING_THRESHOLD = 0.7
-HARVEST_MATCHING_THRESHOLD = 0.8
+HARVEST_MATCHING_THRESHOLD = 0.6
+# A tool icon genuinely tied to a click should appear reasonably close to
+# it. A "match" far from the click (e.g. a HUD icon in a screen corner
+# that coincidentally resembles the template) is rejected instead of
+# dragged to, however high its confidence score.
+MAX_TOOL_DISTANCE = 500
 WHEAT_MATCHING_THRESHOLD = 0.3
 WHEAT_GROWING_MATCHING_THRESHOLD = 0.7
 BOAT_MATCHING_THRESHOLD = 0.7
@@ -30,37 +38,69 @@ MARKET_MATCHING_THRESHOLD = 0.6
 SOLD_MATCHING_THRESHOLD = 0.6
 NEW_OFFER_MATCHING_THRESHOLD = 0.6
 PLANT_OFFER_MATCHING_THRESHOLD = 0.9
-PLANTING_TOOL_MATCHING_THRESHOLD = 0.7
+PLANTING_TOOL_MATCHING_THRESHOLD = 0.6
+FIELD_SELECTED_MATCHING_THRESHOLD = 0.6
+WHEAT_SELECTED_MATCHING_THRESHOLD = 0.6
 NEWSPAPER_MATCHING_THRESHOLD = 0.6
 INSERT_BUTTON_MATCHING_THRESHOLD = 0.9
 SILO_MATCHING_THRESHOLD = 0.9
 CLOSE_MATCHING_THRESHOLD = 0.4
+STORE_MATCHING_THRESHOLD = 0.6
+# Observed false positives on store_sold.png cluster tightly at 0.618-0.625
+# confidence (a coincidentally similar-looking world object, not the real
+# "SOLD!" banner, which has never yet matched at all). Set with a solid
+# margin above that band; revisit once a genuine sale is ever observed.
+STORE_SOLD_MATCHING_THRESHOLD = 0.75
+STORE_RESTOCK_MIN_QUANTITY = 10
 DETECTION_SCALES = (0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
 
+_detected_width, _detected_height = pa.size()
 SCREEN_DIM = {
     'left': 0,
     'top': 0,
-    'width': 1920,
-    'height': 1080
+    'width': _detected_width,
+    'height': _detected_height,
 }
 
 BOAT_ANCHOR = (1075, 285)
 MARKET_ANCHOR = (770, 1150)
 
-plant_img = cv2.imread('templates/plants/wheat.png', cv2.IMREAD_UNCHANGED)
-plant_growing_img = cv2.imread('templates/plants/wheat_growing.png', cv2.IMREAD_UNCHANGED)
-planting_interface_img = cv2.imread('templates/interface/planting_wheat.png', cv2.IMREAD_UNCHANGED)
-field_img = cv2.imread('templates/environment/field.png', cv2.IMREAD_UNCHANGED)
-harvesting_interface_img = cv2.imread('templates/interface/harvest_scythe.png', cv2.IMREAD_UNCHANGED)
-boat_img = cv2.imread('templates/environment/boat.png', cv2.IMREAD_UNCHANGED)
-market_img = cv2.imread('templates/environment/market.png', cv2.IMREAD_UNCHANGED)
-sold_img = cv2.imread('templates/interface/sold.png', cv2.IMREAD_UNCHANGED)
-new_offer_img = cv2.imread('templates/interface/new_offer.png', cv2.IMREAD_UNCHANGED)
-plant_offer_img = cv2.imread('templates/interface/wheat_market.png', cv2.IMREAD_UNCHANGED)
-newspaper_img = cv2.imread('templates/interface/newspaper.png', cv2.IMREAD_UNCHANGED)
-insert_button_img = cv2.imread('templates/interface/insert_button.png', cv2.IMREAD_UNCHANGED)
-silo_img = cv2.imread('templates/interface/silo.png', cv2.IMREAD_UNCHANGED)
-close_img = cv2.imread('templates/interface/close.png', cv2.IMREAD_UNCHANGED)
+def _load_template(path):
+    """Load a template and normalize it to 4-channel BGRA.
+
+    mss screen captures are always BGRA. cv2.matchTemplate requires the
+    template and target to share a channel count, so a template
+    re-saved by an image editor without an alpha channel (3-channel
+    BGR) would otherwise crash matchTemplate the moment it's used.
+    """
+    image = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        return None
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGRA)
+    if image.shape[2] == 3:
+        return cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
+    return image
+
+
+plant_img = _load_template('templates/plants/wheat.png')
+plant_growing_img = _load_template('templates/plants/wheat_growing.png')
+planting_interface_img = _load_template('templates/interface/planting_wheat.png')
+field_selected_img = _load_template('templates/interface/field_selected.png')
+wheat_selected_img = _load_template('templates/interface/wheat_selected.png')
+field_img = _load_template('templates/environment/field.png')
+harvesting_interface_img = _load_template('templates/interface/harvest_scythe.png')
+boat_img = _load_template('templates/environment/boat.png')
+market_img = _load_template('templates/environment/market.png')
+sold_img = _load_template('templates/interface/sold.png')
+new_offer_img = _load_template('templates/interface/new_offer.png')
+plant_offer_img = _load_template('templates/interface/wheat_market.png')
+newspaper_img = _load_template('templates/interface/newspaper.png')
+insert_button_img = _load_template('templates/interface/insert_button.png')
+silo_img = _load_template('templates/interface/silo.png')
+close_img = _load_template('templates/interface/close.png')
+store_img = _load_template('templates/environment/store.png')
+store_sold_img = _load_template('templates/environment/store_sold.png')
 
 
 class Bot:
@@ -90,8 +130,10 @@ class Bot:
         self._loop_lock = Lock()
         self.scythe_timeout = 4.0
         self.scythe_poll_interval = 0.2
+        self.store_timeout = 5.0
         self.drag_press_hold = 0.25
         self.drag_point_duration = 0.15
+        self.drag_point_settle = 0.05
         self.drag_release_hold = 0.1
         self._wheat_scan_saved = False
         self.silo_is_full = False
@@ -173,6 +215,148 @@ class Bot:
     def check_silo_is_full(self, target):
         return len(self.m.match_template(silo_img, target, SILO_MATCHING_THRESHOLD)) > 0
 
+    def _read_quantity_near(self, target, match, offset=(-40, 10), size=(80, 30)):
+        """OCR a small region near a matched icon to read a quantity badge.
+
+        The offset/size are a starting guess for where the game draws the
+        quantity text relative to the icon -- tune them against a real
+        screenshot once the raw OCR text is visible in the logs.
+        """
+        x, y, w, h = match[0], match[1], match[2], match[3]
+        dx, dy = offset
+        box_w, box_h = size
+        left = max(0, x + dx)
+        top = max(0, y + h // 2 + dy)
+        crop = target[top:top + box_h, left:left + box_w]
+        if crop.size == 0:
+            return None, ""
+        gray = cv2.cvtColor(
+            crop,
+            cv2.COLOR_BGRA2GRAY if crop.shape[2] == 4 else cv2.COLOR_BGR2GRAY,
+        )
+        scaled = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        text = pytesseract.image_to_string(
+            scaled,
+            config="--psm 7 -c tessedit_char_whitelist=0123456789",
+        ).strip()
+        return (int(text) if text.isdigit() else None), text
+
+    def restock_roadside_stand(self, target):
+        store_sold_result = self._match_details(store_sold_img, target, STORE_SOLD_MATCHING_THRESHOLD)
+        collected = False
+        if store_sold_result.matches:
+            point = (store_sold_result.matches[0][0], store_sold_result.matches[0][1])
+            self._log(
+                "STORE",
+                "collect_money",
+                point=point,
+                confidence=f"{store_sold_result.best_confidence:.3f}",
+                template_scale=f"{store_sold_result.template_scale:.2f}",
+            )
+            if not self._click(point, "STORE_COLLECT"):
+                return False
+            collected = True
+            if self._wait(1.0):
+                return False
+            target = self.get_target()
+
+        store_result = self._match_details(store_img, target, STORE_MATCHING_THRESHOLD)
+        if not store_result.matches:
+            self._log(
+                "STORE",
+                "not_visible",
+                confidence=f"{store_result.best_confidence:.3f}",
+                template_scale=f"{store_result.template_scale:.2f}",
+                best_candidate=None
+                if store_result.best_match is None
+                else tuple(store_result.best_match[:2]),
+            )
+            # Collecting money may have opened something we don't
+            # recognize (a reward popup, etc.) instead of returning to
+            # the idle stand -- try to close it instead of leaving it
+            # stuck open for every future loop iteration to trip over.
+            if collected:
+                self.check_unexpected_behaviour(target, reason="store_not_visible_after_collect")
+            return False
+        store = store_result.matches
+
+        wheat_matches = self.m.match_template(plant_offer_img, target, PLANT_OFFER_MATCHING_THRESHOLD)
+        if not wheat_matches:
+            self._log("STORE", "wheat_quantity_not_visible")
+            return False
+
+        quantity, raw_text = self._read_quantity_near(target, wheat_matches[0])
+        self._log("STORE", "wheat_quantity", quantity=quantity, raw_text=raw_text)
+        if quantity is None or quantity <= STORE_RESTOCK_MIN_QUANTITY:
+            return False
+
+        point = (store[0][0], store[0][1])
+        self._log("STORE", "restock_open", point=point, quantity=quantity)
+        if not self._click(point, "STORE_OPEN"):
+            return False
+
+        # Confirm the stand actually opened by waiting for the first
+        # "create new sale" slot to appear.
+        new_sale_target, first_pass_matches = self._wait_for_new_sale()
+        if not first_pass_matches:
+            self._log("STORE", "new_sale_timeout", seconds=self.store_timeout)
+            if new_sale_target is not None:
+                self.check_unexpected_behaviour(new_sale_target, reason="new_sale_timeout")
+            return False
+
+        # Re-detect new_offer_img fresh before every click and repeat
+        # until no slots remain, instead of filling just one -- bounded by
+        # the first pass's count so a persistent bad match (e.g. a locked
+        # slot) can't loop forever.
+        max_offers = len(first_pass_matches)
+        offers_created = 0
+        for _ in range(max_offers):
+            if self._stop_requested():
+                break
+            offer_target = self.get_target()
+            new_sale_result = self._match_details(new_offer_img, offer_target, NEW_OFFER_MATCHING_THRESHOLD)
+            new_sale_matches = new_sale_result.matches
+            self._log(
+                "STORE",
+                "new_sale",
+                matches=len(new_sale_matches),
+                raw_matches=new_sale_result.raw_match_count,
+                confidence=f"{new_sale_result.best_confidence:.3f}",
+                template_scale=f"{new_sale_result.template_scale:.2f}",
+            )
+            if not new_sale_matches:
+                break
+            if self.create_offer(new_sale_matches[0]):
+                offers_created += 1
+
+        self._log("STORE", "restock_complete", offers_created=offers_created, slots_seen=max_offers)
+
+        # Leave the shop instead of leaving it open for the next loop
+        # iteration to trip over -- mirrors sell_items' market exit.
+        exit_target = self.get_target()
+        close = self.m.match_template(close_img, exit_target, CLOSE_MATCHING_THRESHOLD)
+        if close:
+            point = (close[0][0], close[0][1])
+            self._log("STORE", "leave_shop", point=point)
+            self._click(point, "STORE_LEAVE")
+
+        return offers_created > 0
+
+    def _wait_for_new_sale(self):
+        deadline = self.clock() + self.store_timeout
+        last_target = None
+        while not self._stop_requested():
+            last_target = self.get_target()
+            matches = self.m.match_template(new_offer_img, last_target, NEW_OFFER_MATCHING_THRESHOLD)
+            if matches:
+                return last_target, matches
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                break
+            if self._wait(min(self.scythe_poll_interval, remaining)):
+                return last_target, None
+        return last_target, None
+
     def drag_operation(self, drag_start, matches, target):
         boundary = self.m.matchs_to_boundary(matches)
         path = self.m.boundary_to_path(boundary)
@@ -220,31 +404,34 @@ class Bot:
             return False
 
         empty_fields = self.m.match_template(field_img, target, FIELD_MATCHING_THRESHOLD)
-        selected_field_match = select_center_match(empty_fields)
-        if selected_field_match is None:
+        if not empty_fields:
             self._log("PLANT", "empty_fields_gone")
             return False
 
-        selected_field = (selected_field_match[0], selected_field_match[1])
-        before_field_centers = self._match_centers(empty_fields)
-        before_anchors = self.get_anchor_positions(target)
+        field_center = select_field_center(empty_fields)
+        # Click an actual matched field tile, not the group's geometric
+        # center -- if the matches come from several separate patches
+        # (not one contiguous block), the center can fall in the gap
+        # between them, landing the click on grass instead of a tile.
+        click_match = select_nearest_match(empty_fields, field_center)
+        click_point = (click_match[0], click_match[1])
         self._log(
             "PLANT",
-            "open_tool",
+            "select_field",
             matches=len(empty_fields),
-            selected=selected_field,
+            selected=click_point,
         )
-        if not self._click(selected_field, "PLANT_OPEN", clicks=2):
+        if not self._click(click_point, "PLANT_SELECT"):
             return False
 
-        tool_target, tool_result = self._wait_for_plant_tool()
-        if tool_result is None:
-            if not self._stop_requested() and tool_target is not None:
+        wheat_target, wheat_result = self._wait_for_plant_tool()
+        if wheat_result is None:
+            if not self._stop_requested() and wheat_target is not None:
                 screenshot = self.diagnostics.save_failure(
                     "plant_tool_timeout",
-                    tool_target,
+                    wheat_target,
                     matches=empty_fields,
-                    selected=selected_field,
+                    selected=field_center,
                 )
                 self._log(
                     "WAIT_FOR_PLANT_TOOL",
@@ -252,70 +439,76 @@ class Bot:
                     seconds=self.scythe_timeout,
                     screenshot=screenshot,
                 )
-            return True
+            return False
 
-        after_fields = self.m.match_template(
-            field_img,
-            tool_target,
-            FIELD_MATCHING_THRESHOLD,
-        )
-        after_field_centers = self._match_centers(after_fields)
-        after_anchors = self.get_anchor_positions(tool_target)
-        screen_size = (tool_target.shape[1], tool_target.shape[0])
-        translation = estimate_camera_translation(
-            before_anchors,
-            after_anchors,
-            before_field_centers,
-            after_field_centers,
-            screen_size,
-        )
-        translated_fields = translate_points(before_field_centers, translation)
-        translated_field_matches = [
-            [
-                match[0] + translation.dx,
-                match[1] + translation.dy,
-                match[2],
-                match[3],
-            ]
-            for match in empty_fields
-        ]
-        translated_selected = translate_points([selected_field], translation)[0]
-        selected_tool_match = select_nearest_match(
-            tool_result.matches,
-            translated_selected,
-        )
-        if selected_tool_match is None or not translated_fields:
+        # Re-detect the field fresh on the post-click screen instead of
+        # reusing the pre-click positions -- stays correct even if the
+        # click (or anything else) moved the camera.
+        current_fields = self.m.match_template(field_img, wheat_target, FIELD_MATCHING_THRESHOLD)
+        current_center = select_field_center(current_fields)
+        if current_center is None:
             screenshot = self.diagnostics.save_failure(
                 "invalid_plant_plan",
-                tool_target,
-                matches=tool_result.matches,
-                selected=translated_selected,
+                wheat_target,
+                matches=wheat_result.matches,
+                selected=field_center,
             )
             self._log("PLANT_PLAN", "invalid", screenshot=screenshot)
-            return True
+            return False
 
-        tool = (selected_tool_match[0], selected_tool_match[1])
-        sweep_plan = build_field_sweep_plan(translated_field_matches, tool)
-        route = sweep_plan.route
+        tool_match = select_nearest_match(
+            wheat_result.matches,
+            current_center,
+            max_distance=MAX_TOOL_DISTANCE,
+        )
+        if tool_match is None:
+            screenshot = self.diagnostics.save_failure(
+                "invalid_plant_plan",
+                wheat_target,
+                matches=wheat_result.matches,
+                selected=current_center,
+            )
+            self._log("PLANT_PLAN", "invalid", screenshot=screenshot)
+            return False
+
+        tool = (tool_match[0], tool_match[1])
+        selected_field_result = self.m.match_template(
+            field_selected_img,
+            wheat_target,
+            FIELD_SELECTED_MATCHING_THRESHOLD,
+        )
+        selected_field_match = select_nearest_match(
+            selected_field_result,
+            field_center,
+            max_distance=MAX_TOOL_DISTANCE,
+        )
+        if selected_field_match is not None:
+            row_anchor = (selected_field_match[0], selected_field_match[1])
+        else:
+            row_anchor_match = select_nearest_match(current_fields, current_center)
+            row_anchor = (row_anchor_match[0], row_anchor_match[1])
+        self._log(
+            "PLANT",
+            "row_anchor",
+            selection_marker_found=selected_field_match is not None,
+            row_anchor=row_anchor,
+        )
+        route = build_field_route(current_fields, tool, row_start=row_anchor, max_segment=25)
         self._log(
             "PLANT_PLAN",
             "complete",
-            field_matches=len(empty_fields),
-            tool_matches=len(tool_result.matches),
-            raw_matches=tool_result.raw_match_count,
-            confidence=f"{tool_result.best_confidence:.3f}",
-            template_scale=f"{tool_result.template_scale:.2f}",
-            camera_method=translation.method,
-            shift=(translation.dx, translation.dy),
+            field_matches=len(current_fields),
+            tool_matches=len(wheat_result.matches),
+            raw_matches=wheat_result.raw_match_count,
+            confidence=f"{wheat_result.best_confidence:.3f}",
+            template_scale=f"{wheat_result.template_scale:.2f}",
             selected=tool,
-            sweep_bounds=sweep_plan.bounds,
-            sweep_rows=sweep_plan.rows,
             points=len(route),
         )
         self._track_harvest_plan(
-            tool_target,
-            tool_result.matches,
-            translated_selected,
+            wheat_target,
+            wheat_result.matches,
+            current_center,
             tool,
             route,
         )
@@ -458,6 +651,7 @@ class Bot:
                 point=scythe,
                 press_hold=self.drag_press_hold,
                 point_duration=self.drag_point_duration,
+                point_settle=self.drag_point_settle,
             )
             self.mouse.mouseDown(button="left")
             mouse_is_down = True
@@ -473,6 +667,8 @@ class Bot:
                     duration=self.drag_point_duration,
                     _pause=False,
                 )
+                if self._wait(self.drag_point_settle):
+                    return False
             if self._wait(self.drag_release_hold):
                 return False
             return True
@@ -507,7 +703,13 @@ class Bot:
             target,
             WHEAT_MATCHING_THRESHOLD,
         )
-        selected_match = select_center_match(wheat_result.matches)
+        crop_center = select_field_center(wheat_result.matches)
+        # Click an actual matched wheat tile, not the group's geometric
+        # center -- if the matches come from several separate patches
+        # (not one contiguous block), the center can fall in the gap
+        # between them, landing the click on grass instead of wheat.
+        selected_match = select_nearest_match(wheat_result.matches, crop_center) if crop_center else None
+        selected_crop = (selected_match[0], selected_match[1]) if selected_match else None
         self._log(
             "DETECT_WHEAT",
             "complete",
@@ -519,14 +721,11 @@ class Bot:
             if wheat_result.best_match is None
             else tuple(wheat_result.best_match[:2]),
             candidates=self._match_centers(wheat_result.matches),
-            selected=None if selected_match is None else tuple(selected_match[:2]),
+            selected=selected_crop,
         )
-        if selected_match is None:
+        if selected_crop is None:
             return False
 
-        selected_crop = (selected_match[0], selected_match[1])
-        before_crop_centers = self._match_centers(wheat_result.matches)
-        before_anchors = self.get_anchor_positions(target)
         self._log("OPEN_TOOL", "click_wheat", point=selected_crop)
         if not self._click(selected_crop, "OPEN_TOOL"):
             return False
@@ -548,49 +747,64 @@ class Bot:
                 )
             return False
 
-        after_wheat = self._match_details(
+        # Re-detect wheat fresh on the post-click screen instead of
+        # translating the pre-click positions through an estimated camera
+        # shift -- stays correct even if the click (or anything else)
+        # moved the camera.
+        current_wheat = self._match_details(
             plant_img,
             scythe_target,
             WHEAT_MATCHING_THRESHOLD,
         )
-        after_crop_centers = self._match_centers(after_wheat.matches)
-        after_anchors = self.get_anchor_positions(scythe_target)
-        screen_size = (scythe_target.shape[1], scythe_target.shape[0])
-        translation = estimate_camera_translation(
-            before_anchors,
-            after_anchors,
-            before_crop_centers,
-            after_crop_centers,
-            screen_size,
-        )
-        translated_crops = translate_points(before_crop_centers, translation)
-        translated_selected = translate_points([selected_crop], translation)[0]
-        self._log(
-            "CAMERA",
-            "translation",
-            method=translation.method,
-            shift=(translation.dx, translation.dy),
-            confidence=translation.confidence,
-            before_anchors=before_anchors,
-            after_anchors=after_anchors,
-        )
-
-        selected_scythe_match = select_nearest_match(
-            scythe_result.matches,
-            translated_selected,
-        )
-        if selected_scythe_match is None or not translated_crops:
+        current_center = select_field_center(current_wheat.matches)
+        if current_center is None:
             screenshot = self.diagnostics.save_failure(
                 "invalid_harvest_plan",
                 scythe_target,
                 matches=scythe_result.matches,
-                selected=translated_selected,
+                selected=selected_crop,
+            )
+            self._log("PLAN_DRAG", "invalid", screenshot=screenshot)
+            return False
+
+        selected_scythe_match = select_nearest_match(
+            scythe_result.matches,
+            current_center,
+            max_distance=MAX_TOOL_DISTANCE,
+        )
+        if selected_scythe_match is None:
+            screenshot = self.diagnostics.save_failure(
+                "invalid_harvest_plan",
+                scythe_target,
+                matches=scythe_result.matches,
+                selected=current_center,
             )
             self._log("PLAN_DRAG", "invalid", screenshot=screenshot)
             return False
 
         scythe = (selected_scythe_match[0], selected_scythe_match[1])
-        route = build_drag_route(translated_crops, scythe, max_segment=25)
+        selected_wheat_result = self.m.match_template(
+            wheat_selected_img,
+            scythe_target,
+            WHEAT_SELECTED_MATCHING_THRESHOLD,
+        )
+        selected_wheat_match = select_nearest_match(
+            selected_wheat_result,
+            selected_crop,
+            max_distance=MAX_TOOL_DISTANCE,
+        )
+        if selected_wheat_match is not None:
+            row_anchor = (selected_wheat_match[0], selected_wheat_match[1])
+        else:
+            row_anchor_match = select_nearest_match(current_wheat.matches, current_center)
+            row_anchor = (row_anchor_match[0], row_anchor_match[1])
+        self._log(
+            "HARVEST",
+            "row_anchor",
+            selection_marker_found=selected_wheat_match is not None,
+            row_anchor=row_anchor,
+        )
+        route = build_field_route(current_wheat.matches, scythe, row_start=row_anchor, max_segment=25)
         self._log(
             "PLAN_DRAG",
             "complete",
@@ -607,7 +821,7 @@ class Bot:
         self._track_harvest_plan(
             scythe_target,
             scythe_result.matches,
-            translated_selected,
+            current_center,
             scythe,
             route,
         )
@@ -623,13 +837,35 @@ class Bot:
             return False
         self._log("SELL", "started")
         # Open market
-        market = self.m.match_template(market_img, target, MARKET_MATCHING_THRESHOLD)
-        if len(market) == 0:
-            self._log("SELL", "market_not_found")
+        market_result = self._match_details(market_img, target, MARKET_MATCHING_THRESHOLD)
+        if not market_result.matches:
+            self._log(
+                "SELL",
+                "market_not_found",
+                confidence=f"{market_result.best_confidence:.3f}",
+                template_scale=f"{market_result.template_scale:.2f}",
+            )
             return False
+        market = market_result.matches
+        # The clickable "shop" hotspot is offset from the detected market
+        # icon rather than a separate template match -- scale that offset
+        # by the same factor the icon itself matched at, so it still lands
+        # correctly if the game is rendering at a different size (e.g. the
+        # emulator window was resized) instead of a fixed pixel count.
+        sell_open_point = (
+            round(market[0][0] + 50 * market_result.template_scale),
+            market[0][1],
+        )
+        self._log(
+            "SELL",
+            "market_found",
+            point=sell_open_point,
+            confidence=f"{market_result.best_confidence:.3f}",
+            template_scale=f"{market_result.template_scale:.2f}",
+        )
         if self._wait(0.2):
             return False
-        if not self._click((market[0][0] + 50, market[0][1]), "SELL_OPEN"):
+        if not self._click(sell_open_point, "SELL_OPEN"):
             return False
         if self._wait(1.0):
             return False
@@ -646,17 +882,41 @@ class Bot:
         if self._wait(1.0):
             return False
 
-        # Create offers
+        # Create offers. Re-detect new_offer_img fresh before every single
+        # click instead of clicking through one stale list of coordinates
+        # -- filling a slot (or anything else) shifting the panel would
+        # otherwise send later clicks to the wrong place. Bounded by the
+        # first pass's match count so a persistent bad match (e.g. a
+        # locked "invite a friend" slot) can't loop forever.
         target = self.get_target()
-        new_offers = self.m.match_template(new_offer_img, target, NEW_OFFER_MATCHING_THRESHOLD)
-        self.track_matches(new_offers, target)
-        if len(new_offers) > 0:
+        first_pass = self._match_details(new_offer_img, target, NEW_OFFER_MATCHING_THRESHOLD)
+        max_offers = len(first_pass.matches)
+        if max_offers > 0:
             self.logger.log("Inserting new offers...")
         else:
             self.logger.log("No slots for offers found!")
-        for offer in new_offers:
-            if not self.create_offer(offer):
+
+        for _ in range(max_offers):
+            if self._stop_requested():
                 break
+            target = self.get_target()
+            new_offer_result = self._match_details(new_offer_img, target, NEW_OFFER_MATCHING_THRESHOLD)
+            new_offers = new_offer_result.matches
+            self.track_matches(new_offers, target)
+            self._log(
+                "SELL",
+                "new_offers",
+                matches=len(new_offers),
+                raw_matches=new_offer_result.raw_match_count,
+                confidence=f"{new_offer_result.best_confidence:.3f}",
+                template_scale=f"{new_offer_result.template_scale:.2f}",
+                candidates=self._match_centers(new_offers),
+            )
+            if not new_offers:
+                break
+            # Don't let one bad slot (e.g. that locked slot) abort the
+            # rest -- keep going regardless of this attempt's outcome.
+            self.create_offer(new_offers[0])
         if self._wait(1.0):
             return False
 
@@ -667,18 +927,38 @@ class Bot:
             return self._click((close[0][0], close[0][1]), "SELL_CLOSE")
         return True
 
+    def _wait_for_match(self, template, threshold):
+        """Poll for a template instead of a single check after a fixed
+        wait -- a UI transition that takes longer than the fixed wait
+        would otherwise make the check run too early and find nothing
+        every single time, not just occasionally.
+        """
+        deadline = self.clock() + self.scythe_timeout
+        last_target = None
+        while not self._stop_requested():
+            last_target = self.get_target()
+            matches = self.m.match_template(template, last_target, threshold)
+            if matches:
+                return last_target, matches
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                break
+            if self._wait(min(self.scythe_poll_interval, remaining)):
+                return last_target, None
+        return last_target, None
+
     def create_offer(self, offer):
         # Open new offer window
         if not self._click((offer[0], offer[1]), "OFFER_OPEN"):
             return False
-        if self._wait(0.5):
-            return False
 
-        # Select target plant to sell
-        target = self.get_target()
-        plant_to_sell = self.m.match_template(plant_offer_img, target, PLANT_OFFER_MATCHING_THRESHOLD)
-        self.track_matches(plant_to_sell, target)
-        if len(plant_to_sell) > 0:
+        # Select target plant to sell. Poll instead of a single fixed-wait
+        # check -- the crop-selection screen can take longer to render
+        # than a flat 0.5s, and a too-early check found nothing every
+        # time, assumed "plants are empty", and closed the whole panel.
+        target, plant_to_sell = self._wait_for_match(plant_offer_img, PLANT_OFFER_MATCHING_THRESHOLD)
+        if plant_to_sell:
+            self.track_matches(plant_to_sell, target)
             if not self._click(
                 (plant_to_sell[0][0], plant_to_sell[0][1]),
                 "OFFER_SELECT_CROP",
@@ -692,7 +972,11 @@ class Bot:
         if self._wait(0.5):
             return False
 
-        # Check if newspaper insert is available
+        # Check if newspaper insert is available. Re-capture fresh here --
+        # this used to reuse the screen from before the crop was even
+        # selected, so the newspaper option (which only appears after
+        # that click) was checked against a stale, pre-selection screen.
+        target = self.get_target()
         newspaper = self.m.match_template(newspaper_img, target, NEWSPAPER_MATCHING_THRESHOLD)
         self.track_matches(newspaper, target)
         if len(newspaper) > 0:
@@ -758,10 +1042,14 @@ class Bot:
                     plant_img,
                     plant_growing_img,
                     planting_interface_img,
+                    field_selected_img,
+                    wheat_selected_img,
                     field_img,
                     harvesting_interface_img,
                     boat_img,
                     market_img,
+                    store_img,
+                    store_sold_img,
                 )
             )
             self._log(
@@ -801,6 +1089,14 @@ class Bot:
                 if self._stop_requested():
                     break
 
+                screen = self.get_target()
+                if self.check_silo_is_full(screen):
+                    self._log("SILO", "full")
+                    self.silo_is_full = True
+                self.restock_roadside_stand(screen)
+                if self._stop_requested():
+                    break
+
                 if self.harvested_plants or self.silo_is_full:
                     self.silo_is_full = False
                     self.sell_items(screen)
@@ -832,10 +1128,6 @@ class Bot:
 
                 if self._stop_requested():
                     break
-                screen = self.get_target()
-                if self.check_silo_is_full(screen):
-                    self._log("SILO", "full")
-                    self.silo_is_full = True
 
                 if self._wait(3.0):
                     break
